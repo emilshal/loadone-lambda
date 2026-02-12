@@ -1,0 +1,42 @@
+.env
+
+# Ignore build outputs
+dist/
+cmd/app/aws/dist/
+
+# Python cache
+__pycache__/
+*.pyc
+    
+# Ignore git backup
+.git_bak/
+
+# Build / binaries
+cmd/app/app
+cmd/app/main
+cmd/app/bootstrap
+*.exe
+*.dll
+*.so
+*.out
+
+# Archives
+*.zip
+
+# Logs
+*.log
+
+# PDFs and temp files
+*.pdf
+*.json
+*payload*.txt
+
+# AWS artifacts
+cmd/app/aws/
+
+# Test/demo files
+cmd/app/dummy-file.txt
+cmd/app/payload.json
+
+old-logs/app.log
+logs/app.log
