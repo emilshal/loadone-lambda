@@ -119,6 +119,7 @@ func buildIntent(cfg Config, in rfq.ParsedRFQMessage, quoteID int) rfq.ActionInt
 	intent.Source = cfg.SourceName
 	intent.Reason = "skeleton default: route RFQ to manual review"
 	intent.QuoteID = quoteID
+	intent.AccessKey = strings.TrimSpace(in.AccessKey)
 	intent.OrderNumber = in.OrderNumber
 	intent.MessageID = in.MessageID
 	intent.ParserLogID = in.ParserLogID

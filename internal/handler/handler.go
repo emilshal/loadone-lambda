@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +24,7 @@ import (
 	"github.com/sirupsen/logrus"
 	models "gitlab.com/emilshal/loadone-lambda/internal/model"
 	"gitlab.com/emilshal/loadone-lambda/internal/parser"
+	"gitlab.com/emilshal/loadone-lambda/internal/rfq"
 	"gitlab.com/emilshal/loadone-lambda/internal/s3client"
 	config "gitlab.com/emilshal/loadone-lambda/pkg"
 	"gorm.io/driver/mysql"
@@ -53,6 +56,60 @@ var (
 	easternLocationOnce sync.Once
 	easternLocation     *time.Location
 )
+
+type loadOneWebhookEvent struct {
+	ID              string             `json:"Id"`
+	Object          string             `json:"Object"`
+	Type            string             `json:"Type"`
+	CreatedDateTime string             `json:"CreatedDateTime"`
+	Livemode        bool               `json:"Livemode"`
+	Data            loadOneWebhookData `json:"Data"`
+}
+
+type loadOneWebhookData struct {
+	QuoteID              int                     `json:"QuoteID"`
+	AccessKey            string                  `json:"AccessKey"`
+	ExpiryDateTime       string                  `json:"ExpiryDateTime"`
+	RequestedVehicleSize string                  `json:"RequestedVehicleSize"`
+	Contacts             []loadOneWebhookContact `json:"Contacts"`
+	Notes                []string                `json:"Notes"`
+	Stops                []loadOneWebhookStop    `json:"Stops"`
+	FreightDetails       []loadOneFreightDetail  `json:"FreightDetails"`
+}
+
+type loadOneWebhookContact struct {
+	FirstName string `json:"FirstName"`
+	LastName  string `json:"LastName"`
+	Email     string `json:"Email"`
+	Phone     string `json:"Phone"`
+	Type      string `json:"Type"`
+	Ext       string `json:"Ext"`
+}
+
+type loadOneWebhookStop struct {
+	Type              string                 `json:"Type"`
+	Location          loadOneWebhookLocation `json:"Location"`
+	ScheduledDateTime string                 `json:"ScheduledDateTime"`
+	LatestDateTime    string                 `json:"LatestDateTime"`
+	Verb              string                 `json:"Verb"`
+}
+
+type loadOneWebhookLocation struct {
+	City    string `json:"City"`
+	State   string `json:"State"`
+	Zip     string `json:"Zip"`
+	Country string `json:"Country"`
+}
+
+type loadOneFreightDetail struct {
+	Pieces    int     `json:"Pieces"`
+	Weight    float64 `json:"Weight"`
+	Length    float64 `json:"Length"`
+	Width     float64 `json:"Width"`
+	Height    float64 `json:"Height"`
+	Stackable bool    `json:"Stackable"`
+	Hazardous bool    `json:"Hazardous"`
+}
 
 func SetDB(database *gorm.DB) {
 	db = database
@@ -130,6 +187,15 @@ func LambdaHandler(ctx context.Context, request events.APIGatewayProxyRequest) (
 		"isFIFO":    isFifoQueue(queueURL),
 		"awsRegion": os.Getenv("AWS_REGION"),
 	}).Info("Ingress toggles")
+	logrus.WithFields(logrus.Fields{
+		"httpMethod":      request.HTTPMethod,
+		"path":            request.Path,
+		"isBase64Encoded": request.IsBase64Encoded,
+		"bodyBytes":       len(request.Body),
+		"contentType":     header(request, "Content-Type"),
+		"userAgent":       header(request, "User-Agent"),
+		"hasHeaders":      len(request.Headers) > 0,
+	}).Info("Inbound request metadata")
 
 	// Decode body
 	var err error
@@ -137,17 +203,29 @@ func LambdaHandler(ctx context.Context, request events.APIGatewayProxyRequest) (
 	if request.IsBase64Encoded {
 		decodedBody, err = DecodeBase64(request.Body)
 		if err != nil {
+			logrus.WithError(err).WithField("rawBodyPreview", truncateForLog(request.Body, 1000)).Error("Invalid Base64 payload")
 			return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Invalid Base64 data"}, nil
 		}
 	} else {
 		decodedBody = request.Body
 	}
+	logrus.WithFields(logrus.Fields{
+		"decodedBytes": len(decodedBody),
+		"preview":      truncateForLog(decodedBody, 1200),
+	}).Info("Decoded request body preview")
+
+	contentType := strings.TrimSpace(strings.ToLower(header(request, "Content-Type")))
+	if looksLikeJSONWebhook(contentType, decodedBody) {
+		return handleLoadOneJSONWebhook(ctx, queueURL, decodedBody, isDryRun)
+	}
 
 	// Parse form data
 	formData, err := url.ParseQuery(decodedBody)
 	if err != nil || len(formData) == 0 {
+		logrus.WithError(err).WithField("decodedBodyPreview", truncateForLog(decodedBody, 1200)).Warn("Failed to parse form data")
 		return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Invalid or empty form data"}, nil
 	}
+	logFormDataSummary(formData)
 
 	subject := formData.Get("subject")
 	bodyHTML := formData.Get("body-html")
@@ -175,6 +253,12 @@ func LambdaHandler(ctx context.Context, request events.APIGatewayProxyRequest) (
 	}
 
 	if bodyHTML == "" && bodyPlain == "" {
+		logrus.WithFields(logrus.Fields{
+			"hasBodyHTML":     bodyHTML != "",
+			"hasBodyPlain":    bodyPlain != "",
+			"hasStrippedHTML": strippedHTML != "",
+			"hasStrippedText": strippedText != "",
+		}).Warn("Inbound form had no email body fields")
 		return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Empty body content"}, nil
 	}
 
@@ -376,13 +460,13 @@ func LambdaHandler(ctx context.Context, request events.APIGatewayProxyRequest) (
 		return events.APIGatewayProxyResponse{StatusCode: 500, Body: "Failed to send message"}, nil
 	}
 
-	// 🔊 CRITICAL: Make it obvious in CloudWatch when a message is actually SENT
+	// CRITICAL: Make it obvious in CloudWatch when a message is actually SENT
 	logrus.WithFields(logrus.Fields{
 		"messageId":        aws.StringValue(out.MessageId),
 		"md5OfMessageBody": aws.StringValue(out.MD5OfMessageBody),
 		"queueURL":         queueURL,
 		"isFIFO":           isFifoQueue(queueURL),
-	}).Info("✅ SQS send succeeded")
+	}).Info("SQS send succeeded")
 
 	rotateLog()
 	return events.APIGatewayProxyResponse{
@@ -430,6 +514,236 @@ func normalizeEasternTimestamp(raw string) (string, string, bool) {
 	}
 
 	return "", raw, false
+}
+
+func looksLikeJSONWebhook(contentType, body string) bool {
+	if strings.Contains(contentType, "application/json") {
+		return true
+	}
+	trimmed := strings.TrimSpace(body)
+	return strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")
+}
+
+func handleLoadOneJSONWebhook(ctx context.Context, queueURL, decodedBody string, isDryRun bool) (events.APIGatewayProxyResponse, error) {
+	event, err := parseLoadOneWebhookEvent(decodedBody)
+	if err != nil {
+		logrus.WithError(err).Warn("Invalid JSON payload")
+		return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Invalid JSON payload"}, nil
+	}
+
+	msg, err := normalizeLoadOneWebhook(event)
+	if err != nil {
+		logrus.WithError(err).WithField("eventType", event.Type).Warn("Unsupported Load1 webhook payload")
+		return events.APIGatewayProxyResponse{StatusCode: 400, Body: err.Error()}, nil
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"eventID":      event.ID,
+		"eventType":    event.Type,
+		"quoteID":      msg.OrderNumber,
+		"accessKey":    maskSecret(msg.AccessKey),
+		"pickup":       strings.TrimSpace(strings.Join([]string{msg.PickupCity, msg.PickupStateCode}, ", ")),
+		"delivery":     strings.TrimSpace(strings.Join([]string{msg.DeliveryCity, msg.DeliveryStateCode}, ", ")),
+		"stopsPresent": msg.PickupCity != "" || msg.DeliveryCity != "",
+	}).Info("Normalized Load1 JSON webhook")
+
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		logrus.WithError(err).Error("Marshal Load1 payload to JSON failed")
+		return events.APIGatewayProxyResponse{StatusCode: 500, Body: "Failed to encode message"}, nil
+	}
+
+	if isDryRun {
+		pretty, _ := json.MarshalIndent(msg, "", "  ")
+		return events.APIGatewayProxyResponse{
+			StatusCode: 200,
+			Body:       string(pretty),
+			Headers:    map[string]string{"Content-Type": "application/json"},
+		}, nil
+	}
+
+	if queueURL == "" {
+		logrus.Error("AWSSQSQueueURL is empty; refusing to send")
+		return events.APIGatewayProxyResponse{StatusCode: 500, Body: "SQS queue URL not configured"}, nil
+	}
+
+	ctxSend, cancel := context.WithTimeout(ctx, 7*time.Second)
+	defer cancel()
+
+	out, err := sendToSQS(ctxSend, queueURL, payload)
+	if err != nil {
+		logrus.WithError(err).Error("SQS send failed for Load1 JSON webhook")
+		return events.APIGatewayProxyResponse{StatusCode: 500, Body: "Failed to send message"}, nil
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"eventID":          event.ID,
+		"eventType":        event.Type,
+		"quoteID":          msg.OrderNumber,
+		"messageId":        aws.StringValue(out.MessageId),
+		"queueURL":         queueURL,
+		"md5OfMessageBody": aws.StringValue(out.MD5OfMessageBody),
+		"isFIFO":           isFifoQueue(queueURL),
+	}).Info("Load1 JSON webhook sent to SQS")
+
+	return events.APIGatewayProxyResponse{
+		StatusCode: 200,
+		Body:       fmt.Sprintf("Load1 webhook accepted. MessageId=%s", aws.StringValue(out.MessageId)),
+	}, nil
+}
+
+func parseLoadOneWebhookEvent(decodedBody string) (loadOneWebhookEvent, error) {
+	var event loadOneWebhookEvent
+	if err := json.Unmarshal([]byte(decodedBody), &event); err != nil {
+		return loadOneWebhookEvent{}, err
+	}
+	return event, nil
+}
+
+func normalizeLoadOneWebhook(event loadOneWebhookEvent) (rfq.ParsedRFQMessage, error) {
+	quoteID := event.Data.QuoteID
+	if quoteID <= 0 {
+		return rfq.ParsedRFQMessage{}, fmt.Errorf("quoteID missing or invalid")
+	}
+
+	pickupStop := firstStopByType(event.Data.Stops, "pickup")
+	deliveryStop := firstStopByType(event.Data.Stops, "delivery")
+	firstContact := firstContact(event.Data.Contacts)
+	firstFreight := firstFreightDetail(event.Data.FreightDetails)
+
+	pickupValue, pickupDisplay := normalizeRFC3339Field(pickupStop.ScheduledDateTime)
+	deliveryValue, deliveryDisplay := normalizeRFC3339Field(deliveryStop.ScheduledDateTime)
+
+	noteParts := make([]string, 0, len(event.Data.Notes)+2)
+	for _, n := range event.Data.Notes {
+		if strings.TrimSpace(n) != "" {
+			noteParts = append(noteParts, strings.TrimSpace(n))
+		}
+	}
+	if strings.TrimSpace(event.Type) != "" {
+		noteParts = append(noteParts, "eventType="+strings.TrimSpace(event.Type))
+	}
+	if strings.TrimSpace(event.Data.ExpiryDateTime) != "" {
+		noteParts = append(noteParts, "expiresAt="+strings.TrimSpace(event.Data.ExpiryDateTime))
+	}
+
+	return rfq.ParsedRFQMessage{
+		OrderNumber:         strconv.Itoa(quoteID),
+		Subject:             fmt.Sprintf("Load1 webhook: %s", strings.TrimSpace(event.Type)),
+		MessageID:           firstNonEmpty(event.ID, strconv.Itoa(quoteID)),
+		ReplyTo:             firstContact.Email,
+		BrokerName:          strings.TrimSpace(strings.Join([]string{firstContact.FirstName, firstContact.LastName}, " ")),
+		SuggestedTruckSize:  strings.TrimSpace(event.Data.RequestedVehicleSize),
+		OriginalTruckSize:   strings.TrimSpace(event.Data.RequestedVehicleSize),
+		Notes:               strings.Join(noteParts, "\n"),
+		PickupCity:          strings.TrimSpace(pickupStop.Location.City),
+		PickupStateCode:     strings.TrimSpace(pickupStop.Location.State),
+		PickupZip:           strings.TrimSpace(pickupStop.Location.Zip),
+		PickupDate:          pickupValue,
+		PickupDateDisplay:   firstNonEmpty(pickupDisplay, strings.TrimSpace(pickupStop.ScheduledDateTime)),
+		DeliveryCity:        strings.TrimSpace(deliveryStop.Location.City),
+		DeliveryStateCode:   strings.TrimSpace(deliveryStop.Location.State),
+		DeliveryZip:         strings.TrimSpace(deliveryStop.Location.Zip),
+		DeliveryDate:        deliveryValue,
+		DeliveryDateDisplay: firstNonEmpty(deliveryDisplay, strings.TrimSpace(deliveryStop.ScheduledDateTime)),
+		Length:              firstFreight.Length,
+		Width:               firstFreight.Width,
+		Height:              firstFreight.Height,
+		Weight:              firstFreight.Weight,
+		Pieces:              firstFreight.Pieces,
+		Stackable:           firstFreight.Stackable,
+		Hazardous:           firstFreight.Hazardous,
+		AccessKey:           strings.TrimSpace(event.Data.AccessKey),
+	}, nil
+}
+
+func normalizeRFC3339Field(raw string) (string, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+	if ts, err := time.Parse(time.RFC3339, raw); err == nil {
+		local := ts.In(loadEasternLocation())
+		return local.Format("2006-01-02 15:04:05"), raw
+	}
+	return "", raw
+}
+
+func firstStopByType(stops []loadOneWebhookStop, stopType string) loadOneWebhookStop {
+	stopType = strings.TrimSpace(strings.ToLower(stopType))
+	for _, stop := range stops {
+		if strings.TrimSpace(strings.ToLower(stop.Type)) == stopType {
+			return stop
+		}
+	}
+	if len(stops) > 0 {
+		return stops[0]
+	}
+	return loadOneWebhookStop{}
+}
+
+func firstContact(contacts []loadOneWebhookContact) loadOneWebhookContact {
+	if len(contacts) == 0 {
+		return loadOneWebhookContact{}
+	}
+	return contacts[0]
+}
+
+func firstFreightDetail(items []loadOneFreightDetail) loadOneFreightDetail {
+	if len(items) == 0 {
+		return loadOneFreightDetail{}
+	}
+	return items[0]
+}
+
+func maskSecret(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if len(s) <= 8 {
+		return "****"
+	}
+	return s[:4] + "..." + s[len(s)-4:]
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func truncateForLog(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...(truncated)"
+}
+
+func logFormDataSummary(form url.Values) {
+	keys := make([]string, 0, len(form))
+	for k := range form {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	summary := make(map[string]string, len(keys))
+	for _, k := range keys {
+		v := strings.TrimSpace(form.Get(k))
+		summary[k] = fmt.Sprintf("len=%d preview=%q", len(v), truncateForLog(v, 220))
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"formKeyCount": len(keys),
+		"formKeys":     keys,
+		"formSummary":  summary,
+	}).Info("Inbound Mailgun form fields")
 }
 
 func normalizeExternalLink(raw string) string {

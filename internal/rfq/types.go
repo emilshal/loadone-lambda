@@ -14,6 +14,7 @@ type ParsedRFQMessage struct {
 	ReplyTo            string  `json:"replyTo"`
 	BrokerName         string  `json:"brokerName"`
 	ParserLogID        int64   `json:"parserLogID"`
+	AccessKey          string  `json:"accessKey,omitempty"`
 	SuggestedTruckSize string  `json:"suggestedTruckSize"`
 	TruckTypeID        int     `json:"truckTypeID"`
 	OriginalTruckSize  string  `json:"originalTruckSize"`
@@ -32,6 +33,15 @@ type ParsedRFQMessage struct {
 	DeliveryZip         string `json:"deliveryZip"`
 	DeliveryDate        string `json:"deliveryDate"`
 	DeliveryDateDisplay string `json:"deliveryDateDisplay"`
+
+	Length float64 `json:"length"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+	Weight float64 `json:"weight"`
+	Pieces int     `json:"pieces"`
+
+	Stackable bool `json:"stackable"`
+	Hazardous bool `json:"hazardous"`
 
 	ExternalLink    string `json:"externalLink"`
 	ExternalLinkRaw string `json:"externalLinkRaw"`
